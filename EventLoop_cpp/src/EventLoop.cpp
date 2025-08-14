@@ -2,10 +2,14 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#ifdef USE_ZJP_THREADPOOL
+#include <threadloop/ThreadLoop.h>
+#endif
 
 EventLoop::EventLoop() {
     // setup epoll and eventfd
@@ -34,6 +38,7 @@ EventLoop& EventLoop::getInstance() {
 }
 
 EventLoop::~EventLoop() {
+    stop();
     {
         std::lock_guard<std::mutex> lck(eventLoopMtx);
         state = EvenLoopState::EV_READY;
@@ -45,15 +50,27 @@ EventLoop::~EventLoop() {
     if (eventThread.joinable()) {
         eventThread.join();
     }
+#ifdef USE_ZJP_THREADPOOL
+    if (zjpThreadloop::ThreadLoop::getThreadLoopInstance().isRunning()) {
+        zjpThreadloop::ThreadLoop::getThreadLoopInstance().join();
+    }
+#endif
     if (epollFd >= 0) close(epollFd);
     if (eventFd >= 0) close(eventFd);
 }
 
 void EventLoop::run() {
+    if (running.load()) return;
+    stopRequested.store(false);
+    running.store(true);
     eventThread = std::thread([this]() {
         constexpr int MAX_EVENTS = 64;
         epoll_event events[MAX_EVENTS];
-        while (true) {
+#ifdef USE_ZJP_THREADPOOL
+        auto &pool = zjpThreadloop::ThreadLoop::getThreadLoopInstance();
+        if (!pool.isRunning()) pool.start();
+#endif
+        while (!stopRequested.load(std::memory_order_relaxed)) {
             int n = epoll_wait(epollFd, events, MAX_EVENTS, -1);
             if (n < 0) {
                 if (errno == EINTR) continue;
@@ -77,7 +94,14 @@ void EventLoop::run() {
                             size--;
                             if (size == 0) state = EvenLoopState::EV_READY;
                         }
-                        if (task.evCallback) task.evCallback(task.arg);
+                        if (task.evCallback) {
+#ifdef USE_ZJP_THREADPOOL
+                            auto cb = task.evCallback; void* a = task.arg;
+                            pool.addTask([cb, a]() { cb(a); });
+#else
+                            task.evCallback(task.arg);
+#endif
+                        }
                     }
                 } else {
                     // I/O event
@@ -96,7 +120,17 @@ void EventLoop::run() {
                 }
             }
         }
+        running.store(false);
     });
+}
+
+void EventLoop::stop() {
+    if (!running.load()) return;
+    stopRequested.store(true);
+    // wake epoll thread via eventfd
+    uint64_t one = 1;
+    ssize_t wr = write(eventFd, &one, sizeof(one));
+    (void)wr;
 }
 
 void EventLoop::addTask(EventCallback cb, void *arg) {

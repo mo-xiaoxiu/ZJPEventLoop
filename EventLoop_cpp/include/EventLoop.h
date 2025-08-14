@@ -8,6 +8,7 @@
 #include <queue>
 #include <unordered_map>
 #include <cstdint>
+#include <atomic>
 
 using EventCallback = std::function<void(void*)>;
 
@@ -43,6 +44,10 @@ private:
     struct IoWatcher { IoCallback cb; void* arg; uint32_t events; };
     std::unordered_map<int, IoWatcher> watchers; // fd -> watcher
 
+    // lifecycle
+    std::atomic<bool> stopRequested{false};
+    std::atomic<bool> running{false};
+
     EventLoop();
 
 public:
@@ -55,6 +60,7 @@ public:
 
     static EventLoop& getInstance();
     void run();
+    void stop();
     void addTask(EventCallback cb, void *arg);
     size_t taskSize();
 

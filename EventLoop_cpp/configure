@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Root-level configure script for EventLoop_cpp
+# Purpose: clone and install third-party thread pool (ZJPTools) before build.
+# Usage:
+#   ./configure --url <git_url> [--branch <branch>] [--no-clean]
+#   or set env ZJPTOOLS_GIT and optional ZJPTOOLS_BRANCH
+
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+THIRDPART_DIR="${ROOT_DIR}/thirdpart"
+ZJP_DIR="${THIRDPART_DIR}/ZJPTools"
+
+GIT_URL=https://github.com/mo-xiaoxiu/ZJPTools.git
+DO_CLEAN=1
+CLEAR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clear)
+      CLEAR=1
+      shift;;
+    --no-clean)
+      DO_CLEAN=0
+      shift;;
+    -h|--help)
+      cat <<EOF
+Usage: ./configure [--no-clean]
+       ./configure [--clean]
+This script clones thirdpart/ZJPTools (if missing) and runs build_tools.sh --build --install
+EOF
+      exit 0;;
+    *) echo "Unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+if [[ ${CLEAR} -eq 1 ]]; then
+  rm -rf "${THIRDPART_DIR}"
+  rm -rf build/
+  exit 0
+fi
+
+mkdir -p "${THIRDPART_DIR}"
+
+if [[ ! -d "${ZJP_DIR}" ]]; then
+  echo "[INFO] Cloning ZJPTools from: ${GIT_URL}"
+  git clone --depth 1 "${GIT_URL}" "${ZJP_DIR}"
+else
+  echo "[INFO] Found existing ${ZJP_DIR}"
+fi
+
+if [[ ! -x "${ZJP_DIR}/build_tools.sh" ]]; then
+  echo "[ERROR] ${ZJP_DIR}/build_tools.sh not found or not executable" >&2
+  exit 1
+fi
+
+pushd "${ZJP_DIR}" >/dev/null
+if [[ ${DO_CLEAN} -eq 1 ]]; then
+  ./build_tools.sh --clean --build
+else
+  ./build_tools.sh --build
+fi
+popd >/dev/null
+
+HDR="${ZJP_DIR}/install/include/threadloop/ThreadLoop.h"
+LIBDIR="${ZJP_DIR}/install/lib"
+if [[ ! -f "${HDR}" ]]; then
+  echo "[ERROR] Missing header: ${HDR}" >&2
+  exit 1
+fi
+if [[ ! -f "${LIBDIR}/libzjpThreadloop.a" && ! -e "${LIBDIR}/libzjpThreadloop.so" && ! -e "${LIBDIR}/libzjpThreadloop.so.1.0.0" ]]; then
+  echo "[ERROR] Missing threadloop library under ${LIBDIR}" >&2
+  exit 1
+fi
+
+echo "[SUCCESS] ZJPTools installed to ${ZJP_DIR}/install"
+echo "Next steps:"
+echo "  cmake -S . -B build -DUSE_ZJP_THREADPOOL=ON"
+echo "  cmake --build build -j"

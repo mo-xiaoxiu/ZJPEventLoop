@@ -7,6 +7,10 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <queue>
+#include <vector>
+#include <mutex>
+#include <chrono>
 #ifdef USE_ZJP_THREADPOOL
 #include <threadloop/ThreadLoop.h>
 #endif
@@ -59,6 +63,12 @@ EventLoop::~EventLoop() {
     if (eventFd >= 0) close(eventFd);
 }
 
+#ifdef USE_ZJP_THREADPOOL
+void EventLoop::addTaskToThreadpool(EventCallback cb, void *arg) {
+    zjpThreadloop::ThreadLoop::getThreadLoopInstance().addTask([cb, arg]() { cb(arg); });
+}
+#endif
+
 void EventLoop::run() {
     if (running.load()) return;
     stopRequested.store(false);
@@ -71,12 +81,16 @@ void EventLoop::run() {
         if (!pool.isRunning()) pool.start();
 #endif
         while (!stopRequested.load(std::memory_order_relaxed)) {
-            int n = epoll_wait(epollFd, events, MAX_EVENTS, -1);
+            auto timeout = getNextTimerTimeout();
+            int timeoutMs = static_cast<int>(timeout.count());
+            int n = epoll_wait(epollFd, events, MAX_EVENTS, timeoutMs);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 perror("epoll_wait");
                 continue;
             }
+            processExpiredTimers();
+
             for (int i = 0; i < n; ++i) {
                 int fd = static_cast<int>(reinterpret_cast<intptr_t>(events[i].data.ptr));
                 if (fd == eventFd) {
@@ -96,8 +110,9 @@ void EventLoop::run() {
                         }
                         if (task.evCallback) {
 #ifdef USE_ZJP_THREADPOOL
-                            auto cb = task.evCallback; void* a = task.arg;
-                            pool.addTask([cb, a]() { cb(a); });
+                            auto cb = task.evCallback;
+                            void* a = task.arg;
+                            addTaskToThreadpool(cb, a);
 #else
                             task.evCallback(task.arg);
 #endif
@@ -192,4 +207,162 @@ int EventLoop::delIo(int fd) {
         return -1;
     }
     return 0;
+}
+
+// Timer management implementations
+uint64_t EventLoop::addTimer(uint64_t delay, uint64_t interval, TimerCallback cb, void *arg) {
+    if (!cb) return 0;
+    
+    bool repeatFlag = (interval == 0) ? false : true;
+
+    auto now = std::chrono::steady_clock::now();
+    auto expireTime = now + std::chrono::milliseconds(delay);
+    uint64_t timerId = nextTimerId.fetch_add(1);
+
+    Timer timer(timerId, expireTime, std::chrono::milliseconds(interval), cb, arg, repeatFlag);
+    {
+        std::lock_guard<std::mutex> lock(timerMutex);
+        timerQueue.push(timer);
+        activeTimers[timerId] = timer;
+    }
+
+    // Wake up the event loop to recalculate timeout
+    uint64_t one = 1;
+    ssize_t wr = write(eventFd, &one, sizeof(one));
+    (void)wr;
+    
+    return timerId;
+}
+
+bool EventLoop::removeTimer(uint64_t timerId) {
+    std::lock_guard<std::mutex> lock(timerMutex);
+    auto it = activeTimers.find(timerId);
+    if (it == activeTimers.end()) {
+        return false;
+    }
+    activeTimers.erase(it);
+    return true;
+}
+
+bool EventLoop::modifyTimer(uint64_t timerId, uint64_t newDelay, uint64_t newInterval) {    
+    std::lock_guard<std::mutex> lock(timerMutex);
+    auto it = activeTimers.find(timerId);
+    if (it == activeTimers.end()) {
+        return false;
+    }
+    bool newRepeatFlag = (newInterval == 0) ? false : true;
+    
+    Timer& oldTimer = it->second;
+    auto now = std::chrono::steady_clock::now();
+    
+    Timer newTimer(timerId, now + std::chrono::milliseconds(newDelay), std::chrono::milliseconds(newInterval), 
+                   oldTimer.callback, oldTimer.arg, newRepeatFlag);
+    
+    timerQueue.push(newTimer);
+    activeTimers[timerId] = newTimer;
+    
+    return true;
+}
+
+size_t EventLoop::timerCount() {
+    std::lock_guard<std::mutex> lock(timerMutex);
+    return activeTimers.size();
+}
+
+std::chrono::milliseconds EventLoop::getNextTimerTimeout() {
+    std::lock_guard<std::mutex> lock(timerMutex);
+    
+    auto now = std::chrono::steady_clock::now();
+    
+    // Clean up expired timers from the top of the queue
+    while (!timerQueue.empty()) {
+        const Timer& topTimer = timerQueue.top();
+        
+        // Check if this timer is still active
+        auto it = activeTimers.find(topTimer.id);
+        if (it == activeTimers.end()) {
+            // Timer was removed, skip it
+            timerQueue.pop();
+            continue;
+        }
+        
+        // Check if timer has expired
+        if (topTimer.expireTime <= now) {
+            return std::chrono::milliseconds(0); // Immediate timeout
+        }
+        
+        // Calculate timeout for next timer
+        auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+            topTimer.expireTime - now);
+        
+        // Apply intelligent timeout strategy:
+        // 1. For very short timers (< 50ms), use exact timeout
+        // 2. For medium timers (50ms - 1s), limit to reasonable max
+        // 3. For long timers (> 1s), use fixed interval to maintain responsiveness
+        
+        if (timeout <= std::chrono::milliseconds(50)) {
+            return timeout; // High precision for short timers
+        } else if (timeout <= std::chrono::milliseconds(MAX_EPOLL_TIMEOUT)) {
+            return std::min(timeout, std::chrono::milliseconds(DEFAULT_TIMEOUT)); // Cap at 100ms
+        } else {
+            return std::chrono::milliseconds(DEFAULT_TIMEOUT); // Fixed 100ms for long timers
+        }
+    }
+    
+    // No active timers, return moderate timeout for I/O responsiveness
+    return std::chrono::milliseconds(DEFAULT_TIMEOUT);
+}
+
+void EventLoop::processExpiredTimers() {
+    auto now = std::chrono::steady_clock::now();
+    std::vector<Timer> expiredTimers;
+    
+    {
+        std::lock_guard<std::mutex> lock(timerMutex);
+        
+        // Collect all expired timers
+        while (!timerQueue.empty()) {
+            Timer topTimer = timerQueue.top();
+            
+            // Check if this timer is still active
+            auto it = activeTimers.find(topTimer.id);
+            if (it == activeTimers.end()) {
+                // Timer was removed, skip it
+                timerQueue.pop();
+                continue;
+            }
+            
+            // Check if timer has expired
+            if (topTimer.expireTime > now) {
+                break; // No more expired timers
+            }
+            
+            // Timer has expired
+            expiredTimers.push_back(topTimer);
+            timerQueue.pop();
+            
+            // If it's a repeating timer, reschedule it
+            if (topTimer.repeating) {
+                Timer newTimer(topTimer.id, now + topTimer.interval, 
+                              topTimer.interval, topTimer.callback, 
+                              topTimer.arg, true);
+                timerQueue.push(newTimer);
+                activeTimers[topTimer.id] = newTimer;
+            } else {
+                // Remove one-shot timer from active timers
+                activeTimers.erase(topTimer.id);
+            }
+        }
+    }
+    
+    // Execute expired timer callbacks outside of the lock
+    for (const Timer& timer : expiredTimers) {
+        if (timer.callback) {
+#ifdef USE_ZJP_THREADPOOL
+            addTaskToThreadpool([timer](void*) { timer.callback(timer.arg); }, nullptr);
+#else
+            timer.callback(timer.arg);
+#endif
+        }
+    }
 }

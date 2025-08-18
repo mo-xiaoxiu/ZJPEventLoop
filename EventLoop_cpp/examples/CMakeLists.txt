@@ -1,14 +1,26 @@
-add_executable(example examples.cpp)
+cmake_minimum_required(VERSION 3.10)
+project(EventLoopExamples)
 
-target_include_directories(example PUBLIC ../include)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-target_link_libraries(example eventloop)
+# Debug configuration for GDB
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 
-target_compile_options(example PRIVATE
-    -O0            # 关闭优化，便于单步
-    -g3 -ggdb      # 最大级别调试信息
-    -fno-omit-frame-pointer
-)
-target_link_options(example PRIVATE
-    -g
-)
+# Include directories
+include_directories(../include)
+
+# Add the EventLoop library
+add_library(EventLoop ../src/EventLoop.cpp)
+
+# Link libraries
+target_link_libraries(EventLoop pthread)
+
+# Original examples executable
+add_executable(examples examples.cpp)
+target_link_libraries(examples EventLoop)
+
+# New timer example executable
+add_executable(timer_example timer_example.cpp)
+target_link_libraries(timer_example EventLoop)

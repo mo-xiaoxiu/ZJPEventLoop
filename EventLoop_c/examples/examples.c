@@ -67,6 +67,9 @@ int main(int argc, char *argv[]) {
     if (flags != -1) fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     event_loop_add_io(&loop, STDIN_FILENO, EPOLLIN, stdin_cb, &loop);
 
+    event_loop_add_timer(&loop, 1000, 1000, test_callback_1, NULL);
+    event_loop_add_timer(&loop, 2000, 0, test_callback_2, NULL);
+
     while (true) {
         sleep(1);
     }

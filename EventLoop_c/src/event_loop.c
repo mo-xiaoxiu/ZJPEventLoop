@@ -8,10 +8,95 @@
 #include <stdint.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "event_loop.h"
 
 static struct _io_watcher* find_io_watcher(event_loop_t *loop, int fd);
+
+// Get current time in milliseconds
+static uint64_t get_current_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+}
+
+// Calculate timeout for epoll_wait based on next timer
+static int get_next_timer_timeout(event_loop_t *loop) {
+    pthread_mutex_lock(&loop->timer_mtx);
+    
+    if (!loop->timer_head) {
+        pthread_mutex_unlock(&loop->timer_mtx);
+        return -1; // No timers, block indefinitely
+    }
+    
+    uint64_t now = get_current_time_ms();
+    uint64_t next_expire = loop->timer_head->expire_time;
+    
+    pthread_mutex_unlock(&loop->timer_mtx);
+    
+    if (next_expire <= now) {
+        return 0; // Timer already expired, don't block
+    }
+    
+    int timeout = (int)(next_expire - now);
+    return timeout > 100 ? 100 : timeout; // Cap at 100ms for responsiveness
+}
+
+// Insert timer into sorted list (earliest first)
+static void insert_timer_sorted(event_loop_t *loop, timer_zjp_t *timer) {
+    timer_zjp_t **current = &loop->timer_head;
+    
+    while (*current && (*current)->expire_time <= timer->expire_time) {
+        current = &(*current)->next;
+    }
+    
+    timer->next = *current;
+    *current = timer;
+}
+
+// Process all expired timers
+static void process_expired_timers(event_loop_t *loop) {
+    uint64_t now = get_current_time_ms();
+    timer_zjp_t *expired_list = NULL;
+    
+    pthread_mutex_lock(&loop->timer_mtx);
+    
+    // Collect expired timers
+    while (loop->timer_head && loop->timer_head->expire_time <= now) {
+        timer_zjp_t *expired = loop->timer_head;
+        loop->timer_head = expired->next;
+        
+        // Add to expired list
+        expired->next = expired_list;
+        expired_list = expired;
+    }
+    
+    pthread_mutex_unlock(&loop->timer_mtx);
+    
+    // Execute callbacks and handle repeating timers
+    while (expired_list) {
+        timer_zjp_t *timer = expired_list;
+        expired_list = expired_list->next;
+        
+        // Execute callback
+        if (timer->cb) {
+            timer->cb(timer->arg);
+        }
+        
+        // Handle repeating timers
+        if (timer->repeat && timer->interval > 0) {
+            timer->expire_time = now + timer->interval;
+            
+            pthread_mutex_lock(&loop->timer_mtx);
+            insert_timer_sorted(loop, timer);
+            pthread_mutex_unlock(&loop->timer_mtx);
+        } else {
+            free(timer);
+        }
+    }
+}
 
 static void* event_loop_worker(void *arg) {
     event_loop_t *loop = (event_loop_t *)arg;
@@ -20,12 +105,15 @@ static void* event_loop_worker(void *arg) {
     struct epoll_event events[64];
 
     while (true) {
-        int n = epoll_wait(loop->epoll_fd, events, MAX_EVENTS, -1);
+        int timeout = get_next_timer_timeout(loop);
+        int n = epoll_wait(loop->epoll_fd, events, MAX_EVENTS, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
             continue;
         }
+
+        process_expired_timers(loop);
 
         for (int i = 0; i < n; ++i) {
             int fd = (int)(intptr_t)events[i].data.ptr; /* we store fd via pointer cast */
@@ -73,6 +161,10 @@ void event_loop_init(event_loop_t *loop) {
     loop->event_loop_state = EV_READY;
     pthread_mutex_init(&loop->event_loop_mtx, NULL);
     pthread_cond_init(&loop->event_loop_cond, NULL);
+
+    loop->next_timer_id = 0;
+    loop->timer_head = NULL;
+    pthread_mutex_init(&loop->timer_mtx, NULL);
 
     /* epoll + eventfd setup */
     loop->io_head = NULL;
@@ -200,4 +292,68 @@ int event_loop_del_io(event_loop_t *loop, int fd) {
         return -1;
     }
     return 0;
+}
+
+int event_loop_add_timer(event_loop_t *loop, uint64_t delay, uint64_t interval, timer_callback_t cb, void *arg) {
+    timer_zjp_t *timer = (timer_zjp_t*)malloc(sizeof(timer_zjp_t));
+    if (!timer) return -1;
+    timer->expire_time = get_current_time_ms() + delay;
+    timer->cb = cb;
+    timer->arg = arg;
+    timer->repeat = interval > 0;
+    timer->interval = interval;
+    timer->next = NULL;
+
+    pthread_mutex_lock(&loop->timer_mtx);
+    timer->timer_id = loop->next_timer_id++;
+    insert_timer_sorted(loop, timer);
+    pthread_mutex_unlock(&loop->timer_mtx);
+
+    return timer->timer_id;
+}
+
+int event_loop_del_timer(event_loop_t *loop, uint64_t timer_id) {
+    pthread_mutex_lock(&loop->timer_mtx);
+    timer_zjp_t **pp = &loop->timer_head;
+    while (*pp) {
+        if ((*pp)->timer_id == timer_id) {
+            timer_zjp_t *rm = *pp;
+            *pp = rm->next;
+            pthread_mutex_unlock(&loop->timer_mtx);
+            free(rm);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&loop->timer_mtx);
+    return -1;
+}
+
+int event_loop_mod_timer(event_loop_t *loop, uint64_t timer_id, uint64_t new_delay, uint64_t new_interval) {
+    pthread_mutex_lock(&loop->timer_mtx);
+    timer_zjp_t **pp = &loop->timer_head;
+    while (*pp) {
+        if ((*pp)->timer_id == timer_id) {
+            (*pp)->expire_time = get_current_time_ms() + new_delay;
+            (*pp)->interval = new_interval;
+            (*pp)->repeat = new_interval > 0;
+            pthread_mutex_unlock(&loop->timer_mtx);
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&loop->timer_mtx);
+    return -1;
+}
+
+int event_loop_timer_count(event_loop_t *loop) {
+    pthread_mutex_lock(&loop->timer_mtx);
+    int count = 0;
+    timer_zjp_t *cur = loop->timer_head;
+    while (cur) {
+        count++;
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&loop->timer_mtx);
+    return count;
 }

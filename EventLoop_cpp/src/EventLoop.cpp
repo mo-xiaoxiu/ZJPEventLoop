@@ -276,13 +276,12 @@ std::chrono::milliseconds EventLoop::getNextTimerTimeout() {
     
     // Clean up expired timers from the top of the queue
     while (!timerQueue.empty()) {
-        const Timer& topTimer = timerQueue.top();
+        Timer topTimer = timerQueue.top();
         
         // Check if this timer is still active
         auto it = activeTimers.find(topTimer.id);
         if (it == activeTimers.end()) {
             // Timer was removed, skip it
-            timerQueue.pop();
             continue;
         }
         
